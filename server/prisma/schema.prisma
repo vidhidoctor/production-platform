@@ -1,0 +1,169 @@
+// Phase 1 schema: masters + production orders. No auth, costing or snapshots yet.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum MaterialCategory {
+  SEQUENCE // PCS -> CD -> Roll
+  BEAD // PCS -> KG   (bead, moti, pipe, zardoshi)
+  CORD // MTR -> KG   (via denier)
+}
+
+// One row per material column in the Excel (3-MM, 4-MM, 2.5-MM, CORD ...).
+// Materials are rows, not table columns, so adding one needs no migration.
+model Material {
+  id        Int              @id @default(autoincrement())
+  code      String           @unique // e.g. "SEQ-3MM", "BEAD-2.5MM", "CORD"
+  name      String // label shown in UI
+  category  MaterialCategory
+  sortOrder Int              @default(0)
+
+  // Conversion rules — only the fields for the material's category are used.
+  seqPerCd   Int? // SEQUENCE: sequences in one CD       (SEQ/CD)
+  cdPerRoll  Int? // SEQUENCE: CDs in one roll           (TOTAL CD)
+  cdPerRound Int? // SEQUENCE: informational             (CD/ROUND)
+  pcsPerKg   Int? // BEAD:     pieces in one KG          (PCS/KG)
+  denier     Int? // CORD:     denier used for MTR -> KG
+
+  consumptions Consumption[]
+}
+
+// A design (e.g. 26-2004) is the parent record; its components (KALI, GALISH ...) and their
+// sizes are the Punching Master rows below. Production orders refer to it by designNo.
+model Design {
+  designNo    String   @id // "26-49" (stored upper-case)
+  productName String // "Lehenga Choli", "Plazo" ...
+  createdAt   DateTime @default(now())
+
+  items PunchingItem[]
+}
+
+// Punching Master row: one Component + Size of a design (26-49 KALI 18, 26-49 BELT ALL ...).
+// Consumption is per design, so the same component can differ between designs.
+model PunchingItem {
+  id        Int    @id @default(autoincrement())
+  designNo  String
+  component String // FROCK, KALI, BLOUSE, BELT, GALISH (stored upper-case)
+  size      String // "18", "28", "ALL"
+  stitch    Int? // required for new entries; null only on rows loaded before it was captured
+  laser     Int? // optional
+
+  design       Design        @relation(fields: [designNo], references: [designNo], onUpdate: Cascade)
+  consumptions Consumption[]
+  orderLines   OrderLine[]
+
+  @@unique([designNo, component, size])
+}
+
+// Per-piece consumption of one material for one Design + Component + Size.
+// Only non-zero materials need a row.
+model Consumption {
+  id             Int     @id @default(autoincrement())
+  punchingItemId Int
+  materialId     Int
+  qtyPerPiece    Decimal @db.Decimal(14, 3)
+
+  punchingItem PunchingItem @relation(fields: [punchingItemId], references: [id], onDelete: Cascade)
+  material     Material     @relation(fields: [materialId], references: [id])
+
+  @@unique([punchingItemId, materialId])
+}
+
+enum OrderStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+model ProductionOrder {
+  id        Int         @id @default(autoincrement())
+  party     String
+  designNo  String
+  item      String
+  orderDate DateTime    @db.Date
+  quantity  Int? // the Order Quantity entered for the design; null on orders made before it existed
+  status    OrderStatus @default(PENDING)
+  createdAt DateTime    @default(now())
+
+  lines OrderLine[]
+
+  @@index([designNo])
+}
+
+model OrderLine {
+  id             Int @id @default(autoincrement())
+  orderId        Int
+  punchingItemId Int
+  quantity       Int
+
+  order        ProductionOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  punchingItem PunchingItem    @relation(fields: [punchingItemId], references: [id])
+}
+
+// --- Authentication & RBAC ---
+// Access is checked by permission code, never by role name, so a role's
+// abilities can change without code changes.
+
+model Department {
+  id    Int    @id @default(autoincrement())
+  name  String @unique // "Punching", "Production", "Administration"
+  users User[]
+}
+
+model Permission {
+  id          Int    @id @default(autoincrement())
+  code        String @unique // e.g. "PRODUCTION_VIEW"
+  description String @default("")
+  roles       Role[]
+}
+
+model Role {
+  id          Int          @id @default(autoincrement())
+  name        String       @unique // "Admin", "Punching Employee", "Production Employee"
+  permissions Permission[]
+  users       User[]
+}
+
+model User {
+  id           Int      @id @default(autoincrement())
+  name         String
+  email        String   @unique // stored lower-case
+  passwordHash String
+  isActive     Boolean  @default(false) // sign-ups wait for Admin activation
+  roleId       Int?
+  departmentId Int?
+  createdAt    DateTime @default(now())
+
+  role           Role?           @relation(fields: [roleId], references: [id])
+  department     Department?     @relation(fields: [departmentId], references: [id])
+  sessions       Session[]
+  passwordResets PasswordReset[]
+}
+
+// Opaque login token; only its SHA-256 is stored. Deleting the row = logout.
+model Session {
+  id        Int      @id @default(autoincrement())
+  tokenHash String   @unique
+  userId    Int
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model PasswordReset {
+  id        Int       @id @default(autoincrement())
+  tokenHash String    @unique
+  userId    Int
+  expiresAt DateTime
+  usedAt    DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
